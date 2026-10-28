@@ -1,0 +1,380 @@
+name: build-mod
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: write sources
+        run: |
+          mkdir -p native mod
+          cat > native/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(mod CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          add_subdirectory(${CMAKE_SOURCE_DIR}/../Dobby dobby)
+          add_library(mod SHARED mod.cpp)
+          target_include_directories(mod PRIVATE ${CMAKE_SOURCE_DIR}/../Dobby/include)
+          target_link_libraries(mod dobby_static log dl)
+          target_link_options(mod PRIVATE -Wl,-z,max-page-size=16384)
+          EOF
+          cat > native/mod.cpp <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <android/log.h>
+          #include <atomic>
+          #include <mutex>
+          #include <string>
+          #include <cstring>
+          #include "dobby.h"
+
+          // ---- names from il2cpp dump (Race Master, il2cpp v31) ----
+          constexpr const char* kAsm        = "Assembly-CSharp";
+          constexpr const char* kNsProfile  = "EasyGames.RaceMaster";
+          constexpr const char* kNsCarMove  = "EasyGames.RaceMaster.CarMovement";
+          constexpr const char* kNsActor    = "EasyGames.RaceMaster.Actors.Car";
+          constexpr unsigned    kStartDelayS = 10;
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "racemod", __VA_ARGS__)
+          using P = void*;
+
+          // ---- state shared with the UI ----
+          static std::atomic<bool>  gMoneyLock{false}, gGemLock{false}, gSpeedOn{false};
+          static std::atomic<int>   gMoney{999999}, gGems{9999};
+          static std::atomic<int>   gMoneyOnce{-1}, gGemOnce{-1};
+          static std::atomic<float> gKmh{200.f};
+
+          static std::mutex gStatusMx;
+          static std::string gStatus = "starting";
+          static void Status(const std::string& s) { std::lock_guard<std::mutex> l(gStatusMx); gStatus = s; LOG("%s", s.c_str()); }
+
+          extern "C" JNIEXPORT void JNICALL Java_mod_Init_cfg(JNIEnv*, jclass, jboolean ml, jint m, jboolean gl, jint g, jboolean so, jfloat k) {
+              gMoneyLock = ml; gMoney = m; gGemLock = gl; gGems = g; gSpeedOn = so; gKmh = k;
+          }
+          extern "C" JNIEXPORT void JNICALL Java_mod_Init_once(JNIEnv*, jclass, jint kind, jint v) {
+              if (kind == 0) gMoneyOnce = v; else gGemOnce = v;
+          }
+          extern "C" JNIEXPORT jstring JNICALL Java_mod_Init_status(JNIEnv* env, jclass) {
+              std::lock_guard<std::mutex> l(gStatusMx);
+              return env->NewStringUTF(gStatus.c_str());
+          }
+
+          // ---- il2cpp api ----
+          #define API(ret, name, args) static ret (*name) args
+          API(P,    il2cpp_domain_get, ());
+          API(P,    il2cpp_thread_attach, (P));
+          API(P,    il2cpp_domain_assembly_open, (P, const char*));
+          API(P,    il2cpp_assembly_get_image, (P));
+          API(P,    il2cpp_class_from_name, (P, const char*, const char*));
+          API(P,    il2cpp_class_get_field_from_name, (P, const char*));
+          API(P,    il2cpp_class_get_method_from_name, (P, const char*, int));
+          API(int,  il2cpp_field_get_offset, (P));
+          API(void, il2cpp_field_get_value, (P, P, P));
+          API(void, il2cpp_field_set_value, (P, P, P));
+          API(void, il2cpp_field_static_get_value, (P, P));
+          API(P,    il2cpp_runtime_invoke, (P, P, P*, P*));
+
+          // ---- resolved members ----
+          static P fMoney, fGems;                    // PlayerProfile.m_CurrencyAmount / m_PremiumCurrencyAmount
+          static P mAddMoney, mSpendMoney, mAddGems, mSpendGems;
+          static P fPlayerCurrent;                   // PlayerCarActor.s_Current (static)
+          static int oMovModule, oMaxOverride, oMinSpeed; // CarActor.m_MovementModule, CarMovementModule.maxSpeedKmPerHourOverride / minSpeedKmPerHour
+
+          static void (*oProfileUpdate)(P, float, P);
+          static void (*oMoveUpdate)(P, float, float, float, bool, P);
+
+          // bring currency to `want`: Add/Spend (fires the game's own UI events), field write as fallback
+          static void ApplyCurrency(P self, P field, P addM, P spendM, int want) {
+              int cur = 0; il2cpp_field_get_value(self, field, &cur);
+              if (cur == want) return;
+              int src = 0, amount = want > cur ? want - cur : cur - want;
+              void* args[2] = { &amount, &src };
+              P exc = nullptr;
+              P m = want > cur ? addM : spendM;
+              if (m) il2cpp_runtime_invoke(m, self, args, &exc);
+              il2cpp_field_get_value(self, field, &cur);
+              if (cur != want) il2cpp_field_set_value(self, field, &want);
+          }
+
+          // main-thread tick (PlayerProfile.HandleOnUpdate): UI events must not be raised from our own thread
+          static void hProfileUpdate(P self, float dt, P mi) {
+              oProfileUpdate(self, dt, mi);
+              int w = gMoneyOnce.exchange(-1);
+              if (w < 0 && gMoneyLock) w = gMoney;
+              if (w >= 0) ApplyCurrency(self, fMoney, mAddMoney, mSpendMoney, w);
+              w = gGemOnce.exchange(-1);
+              if (w < 0 && gGemLock) w = gGems;
+              if (w >= 0) ApplyCurrency(self, fGems, mAddGems, mSpendGems, w);
+          }
+
+          // player car only: pin min/max speed (km/h) right before the movement module clamps velocity
+          static void hMoveUpdate(P self, float a, float b, float c, bool d, P mi) {
+              if (gSpeedOn) {
+                  P actor = nullptr;
+                  il2cpp_field_static_get_value(fPlayerCurrent, &actor);
+                  if (actor && *(P*)((char*)actor + oMovModule) == self) {
+                      float k = gKmh;
+                      *(float*)((char*)self + oMaxOverride) = k;
+                      *(float*)((char*)self + oMinSpeed) = k;
+                  }
+              }
+              oMoveUpdate(self, a, b, c, d, mi);
+          }
+
+          static bool Hook(P cls, const char* name, int argc, void* repl, void** orig) {
+              P mi = il2cpp_class_get_method_from_name(cls, name, argc);
+              if (!mi || !*(void**)mi) return false;
+              return DobbyHook(*(void**)mi, repl, orig) == 0;
+          }
+
+          static void* run(void*) {
+              void* h = nullptr;
+              while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD | RTLD_NOW))) usleep(300000);
+          #define LOAD(n) n = (decltype(n))dlsym(h, #n)
+              LOAD(il2cpp_domain_get); LOAD(il2cpp_thread_attach); LOAD(il2cpp_domain_assembly_open);
+              LOAD(il2cpp_assembly_get_image); LOAD(il2cpp_class_from_name); LOAD(il2cpp_class_get_field_from_name);
+              LOAD(il2cpp_class_get_method_from_name); LOAD(il2cpp_field_get_offset); LOAD(il2cpp_field_get_value);
+              LOAD(il2cpp_field_set_value); LOAD(il2cpp_field_static_get_value); LOAD(il2cpp_runtime_invoke);
+              if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_runtime_invoke || !il2cpp_field_get_offset) {
+                  Status("il2cpp api not exported"); return nullptr;
+              }
+              Status("waiting for il2cpp");
+              sleep(kStartDelayS);
+              P dom = nullptr;
+              while (!(dom = il2cpp_domain_get())) usleep(300000);
+              il2cpp_thread_attach(dom);
+
+              P a = nullptr;
+              while (!(a = il2cpp_domain_assembly_open(dom, kAsm))) usleep(500000);
+              P img = il2cpp_assembly_get_image(a);
+
+              std::string st;
+              // money
+              P cProfile = il2cpp_class_from_name(img, kNsProfile, "PlayerProfile");
+              if (cProfile) {
+                  fMoney = il2cpp_class_get_field_from_name(cProfile, "m_CurrencyAmount");
+                  fGems  = il2cpp_class_get_field_from_name(cProfile, "m_PremiumCurrencyAmount");
+                  mAddMoney   = il2cpp_class_get_method_from_name(cProfile, "AddCurrency", 2);
+                  mSpendMoney = il2cpp_class_get_method_from_name(cProfile, "SpendCurrency", 2);
+                  mAddGems    = il2cpp_class_get_method_from_name(cProfile, "AddPremiumCurrency", 2);
+                  mSpendGems  = il2cpp_class_get_method_from_name(cProfile, "SpendPremiumCurrency", 2);
+                  bool ok = fMoney && fGems && Hook(cProfile, "HandleOnUpdate", 1, (void*)hProfileUpdate, (void**)&oProfileUpdate);
+                  st += ok ? "money:ok " : "money:FAIL ";
+              } else st += "money:no-class ";
+
+              // speed
+              P cActor  = il2cpp_class_from_name(img, kNsActor, "CarActor");
+              P cPlayer = il2cpp_class_from_name(img, kNsActor, "PlayerCarActor");
+              P cMove   = il2cpp_class_from_name(img, kNsCarMove, "CarMovementModule");
+              if (cActor && cPlayer && cMove) {
+                  P fMod = il2cpp_class_get_field_from_name(cActor, "m_MovementModule");
+                  P fMax = il2cpp_class_get_field_from_name(cMove, "maxSpeedKmPerHourOverride");
+                  P fMin = il2cpp_class_get_field_from_name(cMove, "minSpeedKmPerHour");
+                  fPlayerCurrent = il2cpp_class_get_field_from_name(cPlayer, "s_Current");
+                  bool ok = fMod && fMax && fMin && fPlayerCurrent;
+                  if (ok) {
+                      oMovModule = il2cpp_field_get_offset(fMod);
+                      oMaxOverride = il2cpp_field_get_offset(fMax);
+                      oMinSpeed = il2cpp_field_get_offset(fMin);
+                      ok = Hook(cMove, "Update", 4, (void*)hMoveUpdate, (void**)&oMoveUpdate);
+                  }
+                  st += ok ? "speed:ok" : "speed:FAIL";
+              } else st += "speed:no-class";
+              Status(st);
+              return nullptr;
+          }
+
+          extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
+              pthread_t t; pthread_create(&t, nullptr, run, nullptr); pthread_detach(t);
+              return JNI_VERSION_1_6;
+          }
+          EOF
+          cat > mod/Init.java <<'EOF'
+          package mod;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.database.Cursor;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.CompoundButton;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class Init extends ContentProvider {
+              static boolean ok;
+              static { try { System.loadLibrary("mod"); ok = true; } catch (Throwable t) { } }
+              static native void cfg(boolean moneyLock, int money, boolean gemLock, int gems, boolean speedOn, float kmh);
+              static native void once(int kind, int value);
+              static native String status();
+
+              static FrameLayout root;
+              static Switch swMoney, swGems, swSpeed;
+              static EditText etMoney, etGems, etSpeed;
+              static TextView tvStatus;
+              static final Handler ui = new Handler(Looper.getMainLooper());
+
+              public boolean onCreate() {
+                  Application app = (Application) getContext().getApplicationContext();
+                  app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                      public void onActivityResumed(Activity a) { attach(a); }
+                      public void onActivityCreated(Activity a, Bundle b) { }
+                      public void onActivityStarted(Activity a) { }
+                      public void onActivityPaused(Activity a) { }
+                      public void onActivityStopped(Activity a) { }
+                      public void onActivitySaveInstanceState(Activity a, Bundle b) { }
+                      public void onActivityDestroyed(Activity a) { }
+                  });
+                  return true;
+              }
+
+              static boolean isUnity(Activity a) {
+                  for (Class<?> c = a.getClass(); c != null; c = c.getSuperclass())
+                      if (c.getName().startsWith("com.unity3d.player.")) return true;
+                  return false;
+              }
+
+              static void attach(Activity a) {
+                  if (!isUnity(a)) return;
+                  if (root == null) build(a);
+                  ViewGroup p = (ViewGroup) root.getParent();
+                  if (p != null) p.removeView(root);
+                  a.addContentView(root, new ViewGroup.LayoutParams(-1, -1));
+              }
+
+              static int num(EditText e, int def) {
+                  try { return (int) Math.max(0, Math.min(Long.parseLong(e.getText().toString().trim()), (long) Integer.MAX_VALUE)); }
+                  catch (Exception x) { return def; }
+              }
+
+              static float flt(EditText e) {
+                  try { return Math.max(0f, Float.parseFloat(e.getText().toString().trim().replace(',', '.'))); }
+                  catch (Exception x) { return 0f; }
+              }
+
+              static void push() {
+                  if (ok) cfg(swMoney.isChecked(), num(etMoney, 0), swGems.isChecked(), num(etGems, 0), swSpeed.isChecked(), flt(etSpeed));
+              }
+
+              static Button button(Activity a, String t, View.OnClickListener l) {
+                  Button b = new Button(a); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l); return b;
+              }
+
+              static Switch sw(Activity a, String t, CompoundButton.OnCheckedChangeListener l) {
+                  Switch s = new Switch(a); s.setText(t); s.setTextColor(0xFFFFFFFF); s.setOnCheckedChangeListener(l); return s;
+              }
+
+              static EditText et(Activity a, String v, int type) {
+                  EditText e = new EditText(a); e.setText(v); e.setTextColor(0xFFFFFFFF); e.setInputType(type); e.setSingleLine(true); return e;
+              }
+
+              static void build(Activity a) {
+                  final float d = a.getResources().getDisplayMetrics().density;
+                  root = new FrameLayout(a);
+
+                  final TextView b = new TextView(a);
+                  b.setText("M"); b.setTextColor(0xFFFFFFFF); b.setGravity(Gravity.CENTER); b.setTextSize(16);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setShape(GradientDrawable.OVAL); g.setColor(0xCC222222); g.setStroke((int) (2 * d), 0xFFFF3B30);
+                  b.setBackground(g);
+                  root.addView(b, new FrameLayout.LayoutParams((int) (44 * d), (int) (44 * d)));
+                  b.setX(8 * d); b.setY(120 * d);
+
+                  final LinearLayout p = new LinearLayout(a);
+                  p.setOrientation(LinearLayout.VERTICAL);
+                  int pd = (int) (10 * d);
+                  p.setPadding(pd, pd, pd, pd);
+                  GradientDrawable pg = new GradientDrawable();
+                  pg.setCornerRadius(12 * d); pg.setColor(0xEE111111);
+                  p.setBackground(pg);
+                  p.setVisibility(View.GONE);
+                  root.addView(p, new FrameLayout.LayoutParams((int) (270 * d), -2));
+                  p.setX(60 * d); p.setY(120 * d);
+
+                  CompoundButton.OnCheckedChangeListener cl = new CompoundButton.OnCheckedChangeListener() {
+                      public void onCheckedChanged(CompoundButton v, boolean c) { push(); }
+                  };
+                  int numType = InputType.TYPE_CLASS_NUMBER;
+                  int decType = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL;
+
+                  swMoney = sw(a, "money (lock)", cl);
+                  etMoney = et(a, "999999", numType);
+                  LinearLayout rowM = new LinearLayout(a);
+                  rowM.addView(button(a, "set now", new View.OnClickListener() { public void onClick(View v) {
+                      if (ok) once(0, num(etMoney, 0)); } }), new LinearLayout.LayoutParams(0, -2, 1));
+                  rowM.addView(button(a, "x10", new View.OnClickListener() { public void onClick(View v) {
+                      etMoney.setText(String.valueOf(Math.min(10L * num(etMoney, 0), (long) Integer.MAX_VALUE))); push(); } }), new LinearLayout.LayoutParams(0, -2, 1));
+
+                  swGems = sw(a, "gems (lock)", cl);
+                  etGems = et(a, "9999", numType);
+                  LinearLayout rowG = new LinearLayout(a);
+                  rowG.addView(button(a, "set now", new View.OnClickListener() { public void onClick(View v) {
+                      if (ok) once(1, num(etGems, 0)); } }), new LinearLayout.LayoutParams(0, -2, 1));
+
+                  swSpeed = sw(a, "speed km/h", cl);
+                  etSpeed = et(a, "200", decType);
+                  LinearLayout rowS = new LinearLayout(a);
+                  rowS.addView(button(a, "-20", new View.OnClickListener() { public void onClick(View v) { step(-20); } }), new LinearLayout.LayoutParams(0, -2, 1));
+                  rowS.addView(button(a, "+20", new View.OnClickListener() { public void onClick(View v) { step(20); } }), new LinearLayout.LayoutParams(0, -2, 1));
+                  rowS.addView(button(a, "apply", new View.OnClickListener() { public void onClick(View v) { push(); } }), new LinearLayout.LayoutParams(0, -2, 1));
+
+                  tvStatus = new TextView(a);
+                  tvStatus.setTextColor(0xFF9AA0A6); tvStatus.setTextSize(11);
+
+                  TextView title = new TextView(a);
+                  title.setText("race mod"); title.setTextColor(0xFFFFFFFF); title.setTextSize(14);
+
+                  p.addView(title);
+                  p.addView(swMoney); p.addView(etMoney); p.addView(rowM);
+                  p.addView(swGems); p.addView(etGems); p.addView(rowG);
+                  p.addView(swSpeed); p.addView(etSpeed); p.addView(rowS);
+                  p.addView(tvStatus);
+
+                  b.setOnTouchListener(new View.OnTouchListener() {
+                      float dx, dy, sx, sy; boolean moved;
+                      public boolean onTouch(View v, MotionEvent e) {
+                          switch (e.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  dx = v.getX() - e.getRawX(); dy = v.getY() - e.getRawY();
+                                  sx = e.getRawX(); sy = e.getRawY(); moved = false; return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (Math.abs(e.getRawX() - sx) > 10 * d || Math.abs(e.getRawY() - sy) > 10 * d) moved = true;
+                                  if (moved) {
+                                      v.setX(e.getRawX() + dx); v.setY(e.getRawY() + dy);
+                                      p.setX(v.getX() + 52 * d); p.setY(v.getY());
+                                  }
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (!moved) p.setVisibility(p.getVisibility() == View.GONE ? View.VISIBLE : View.GONE);
+                                  return true;
+                          }
+                          return false;
+      
