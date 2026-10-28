@@ -24,10 +24,8 @@ jobs:
           cmake_minimum_required(VERSION 3.18)
           project(mod CXX)
           set(CMAKE_CXX_STANDARD 17)
-          add_subdirectory(${CMAKE_SOURCE_DIR}/../Dobby dobby)
           add_library(mod SHARED mod.cpp)
-          target_include_directories(mod PRIVATE ${CMAKE_SOURCE_DIR}/../Dobby/include)
-          target_link_libraries(mod dobby_static log dl)
+          target_link_libraries(mod log dl)
           target_link_options(mod PRIVATE -Wl,-z,max-page-size=16384)
           EOF
           cat > native/mod.cpp <<'EOF'
@@ -40,7 +38,7 @@ jobs:
           #include <mutex>
           #include <string>
           #include <cstring>
-          #include "dobby.h"
+          #include <cstdio>
 
           // ---- names from il2cpp dump (Race Master, il2cpp v31) ----
           constexpr const char* kAsm        = "Assembly-CSharp";
@@ -48,6 +46,8 @@ jobs:
           constexpr const char* kNsCarMove  = "EasyGames.RaceMaster.CarMovement";
           constexpr const char* kNsActor    = "EasyGames.RaceMaster.Actors.Car";
           constexpr unsigned    kStartDelayS = 10;
+          constexpr useconds_t  kTickUs      = 5000;   // speed pin rate
+          constexpr unsigned    kMoneyEvery  = 20;     // money check every N ticks
 
           #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "racemod", __VA_ARGS__)
           using P = void*;
@@ -60,7 +60,7 @@ jobs:
 
           static std::mutex gStatusMx;
           static std::string gStatus = "starting";
-          static void Status(const std::string& s) { std::lock_guard<std::mutex> l(gStatusMx); gStatus = s; LOG("%s", s.c_str()); }
+          static void Status(const std::string& s) { std::lock_guard<std::mutex> l(gStatusMx); gStatus = s; }
 
           extern "C" JNIEXPORT void JNICALL Java_mod_Init_cfg(JNIEnv*, jclass, jboolean ml, jint m, jboolean gl, jint g, jboolean so, jfloat k) {
               gMoneyLock = ml; gMoney = m; gGemLock = gl; gGems = g; gSpeedOn = so; gKmh = k;
@@ -81,64 +81,20 @@ jobs:
           API(P,    il2cpp_assembly_get_image, (P));
           API(P,    il2cpp_class_from_name, (P, const char*, const char*));
           API(P,    il2cpp_class_get_field_from_name, (P, const char*));
-          API(P,    il2cpp_class_get_method_from_name, (P, const char*, int));
           API(int,  il2cpp_field_get_offset, (P));
-          API(void, il2cpp_field_get_value, (P, P, P));
-          API(void, il2cpp_field_set_value, (P, P, P));
           API(void, il2cpp_field_static_get_value, (P, P));
-          API(P,    il2cpp_runtime_invoke, (P, P, P*, P*));
 
-          // ---- resolved members ----
-          static P fMoney, fGems;                    // PlayerProfile.m_CurrencyAmount / m_PremiumCurrencyAmount
-          static P mAddMoney, mSpendMoney, mAddGems, mSpendGems;
-          static P fPlayerCurrent;                   // PlayerCarActor.s_Current (static)
+          static P fProfileCur, fPlayerCur;          // static fields: PlayerProfile.<Current>k__BackingField, PlayerCarActor.s_Current
+          static int oMoney, oGems, oNeedSave;       // PlayerProfile.m_CurrencyAmount / m_PremiumCurrencyAmount / _needSave
           static int oMovModule, oMaxOverride, oMinSpeed; // CarActor.m_MovementModule, CarMovementModule.maxSpeedKmPerHourOverride / minSpeedKmPerHour
 
-          static void (*oProfileUpdate)(P, float, P);
-          static void (*oMoveUpdate)(P, float, float, float, bool, P);
+          static inline P Obj(P o, int off) { return *(P*)((char*)o + off); }
 
-          // bring currency to `want`: Add/Spend (fires the game's own UI events), field write as fallback
-          static void ApplyCurrency(P self, P field, P addM, P spendM, int want) {
-              int cur = 0; il2cpp_field_get_value(self, field, &cur);
-              if (cur == want) return;
-              int src = 0, amount = want > cur ? want - cur : cur - want;
-              void* args[2] = { &amount, &src };
-              P exc = nullptr;
-              P m = want > cur ? addM : spendM;
-              if (m) il2cpp_runtime_invoke(m, self, args, &exc);
-              il2cpp_field_get_value(self, field, &cur);
-              if (cur != want) il2cpp_field_set_value(self, field, &want);
-          }
-
-          // main-thread tick (PlayerProfile.HandleOnUpdate): UI events must not be raised from our own thread
-          static void hProfileUpdate(P self, float dt, P mi) {
-              oProfileUpdate(self, dt, mi);
-              int w = gMoneyOnce.exchange(-1);
-              if (w < 0 && gMoneyLock) w = gMoney;
-              if (w >= 0) ApplyCurrency(self, fMoney, mAddMoney, mSpendMoney, w);
-              w = gGemOnce.exchange(-1);
-              if (w < 0 && gGemLock) w = gGems;
-              if (w >= 0) ApplyCurrency(self, fGems, mAddGems, mSpendGems, w);
-          }
-
-          // player car only: pin min/max speed (km/h) right before the movement module clamps velocity
-          static void hMoveUpdate(P self, float a, float b, float c, bool d, P mi) {
-              if (gSpeedOn) {
-                  P actor = nullptr;
-                  il2cpp_field_static_get_value(fPlayerCurrent, &actor);
-                  if (actor && *(P*)((char*)actor + oMovModule) == self) {
-                      float k = gKmh;
-                      *(float*)((char*)self + oMaxOverride) = k;
-                      *(float*)((char*)self + oMinSpeed) = k;
-                  }
-              }
-              oMoveUpdate(self, a, b, c, d, mi);
-          }
-
-          static bool Hook(P cls, const char* name, int argc, void* repl, void** orig) {
-              P mi = il2cpp_class_get_method_from_name(cls, name, argc);
-              if (!mi || !*(void**)mi) return false;
-              return DobbyHook(*(void**)mi, repl, orig) == 0;
+          // returns current amount after applying `want` (>=0) if given
+          static int Currency(P prof, int off, int want) {
+              int* f = (int*)((char*)prof + off);
+              if (want >= 0 && *f != want) { *f = want; *(bool*)((char*)prof + oNeedSave) = true; }
+              return *f;
           }
 
           static void* run(void*) {
@@ -147,9 +103,8 @@ jobs:
           #define LOAD(n) n = (decltype(n))dlsym(h, #n)
               LOAD(il2cpp_domain_get); LOAD(il2cpp_thread_attach); LOAD(il2cpp_domain_assembly_open);
               LOAD(il2cpp_assembly_get_image); LOAD(il2cpp_class_from_name); LOAD(il2cpp_class_get_field_from_name);
-              LOAD(il2cpp_class_get_method_from_name); LOAD(il2cpp_field_get_offset); LOAD(il2cpp_field_get_value);
-              LOAD(il2cpp_field_set_value); LOAD(il2cpp_field_static_get_value); LOAD(il2cpp_runtime_invoke);
-              if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_runtime_invoke || !il2cpp_field_get_offset) {
+              LOAD(il2cpp_field_get_offset); LOAD(il2cpp_field_static_get_value);
+              if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_field_get_offset || !il2cpp_field_static_get_value) {
                   Status("il2cpp api not exported"); return nullptr;
               }
               Status("waiting for il2cpp");
@@ -162,21 +117,18 @@ jobs:
               while (!(a = il2cpp_domain_assembly_open(dom, kAsm))) usleep(500000);
               P img = il2cpp_assembly_get_image(a);
 
-              std::string st;
-              // money
+              bool moneyOk = false, speedOk = false;
               P cProfile = il2cpp_class_from_name(img, kNsProfile, "PlayerProfile");
               if (cProfile) {
-                  fMoney = il2cpp_class_get_field_from_name(cProfile, "m_CurrencyAmount");
-                  fGems  = il2cpp_class_get_field_from_name(cProfile, "m_PremiumCurrencyAmount");
-                  mAddMoney   = il2cpp_class_get_method_from_name(cProfile, "AddCurrency", 2);
-                  mSpendMoney = il2cpp_class_get_method_from_name(cProfile, "SpendCurrency", 2);
-                  mAddGems    = il2cpp_class_get_method_from_name(cProfile, "AddPremiumCurrency", 2);
-                  mSpendGems  = il2cpp_class_get_method_from_name(cProfile, "SpendPremiumCurrency", 2);
-                  bool ok = fMoney && fGems && Hook(cProfile, "HandleOnUpdate", 1, (void*)hProfileUpdate, (void**)&oProfileUpdate);
-                  st += ok ? "money:ok " : "money:FAIL ";
-              } else st += "money:no-class ";
-
-              // speed
+                  fProfileCur = il2cpp_class_get_field_from_name(cProfile, "<Current>k__BackingField");
+                  P fM = il2cpp_class_get_field_from_name(cProfile, "m_CurrencyAmount");
+                  P fG = il2cpp_class_get_field_from_name(cProfile, "m_PremiumCurrencyAmount");
+                  P fS = il2cpp_class_get_field_from_name(cProfile, "_needSave");
+                  if (fProfileCur && fM && fG && fS) {
+                      oMoney = il2cpp_field_get_offset(fM); oGems = il2cpp_field_get_offset(fG); oNeedSave = il2cpp_field_get_offset(fS);
+                      moneyOk = true;
+                  }
+              }
               P cActor  = il2cpp_class_from_name(img, kNsActor, "CarActor");
               P cPlayer = il2cpp_class_from_name(img, kNsActor, "PlayerCarActor");
               P cMove   = il2cpp_class_from_name(img, kNsCarMove, "CarMovementModule");
@@ -184,18 +136,50 @@ jobs:
                   P fMod = il2cpp_class_get_field_from_name(cActor, "m_MovementModule");
                   P fMax = il2cpp_class_get_field_from_name(cMove, "maxSpeedKmPerHourOverride");
                   P fMin = il2cpp_class_get_field_from_name(cMove, "minSpeedKmPerHour");
-                  fPlayerCurrent = il2cpp_class_get_field_from_name(cPlayer, "s_Current");
-                  bool ok = fMod && fMax && fMin && fPlayerCurrent;
-                  if (ok) {
+                  fPlayerCur = il2cpp_class_get_field_from_name(cPlayer, "s_Current");
+                  if (fMod && fMax && fMin && fPlayerCur) {
                       oMovModule = il2cpp_field_get_offset(fMod);
                       oMaxOverride = il2cpp_field_get_offset(fMax);
                       oMinSpeed = il2cpp_field_get_offset(fMin);
-                      ok = Hook(cMove, "Update", 4, (void*)hMoveUpdate, (void**)&oMoveUpdate);
+                      speedOk = true;
                   }
-                  st += ok ? "speed:ok" : "speed:FAIL";
-              } else st += "speed:no-class";
-              Status(st);
-              return nullptr;
+              }
+              LOG("moneyOk=%d speedOk=%d", moneyOk, speedOk);
+
+              unsigned long tick = 0;
+              int curMoney = -1, curGems = -1;
+              bool car = false;
+              for (;; ++tick, usleep(kTickUs)) {
+                  if (speedOk) {
+                      P actor = nullptr;
+                      il2cpp_field_static_get_value(fPlayerCur, &actor);
+                      P mod = actor ? Obj(actor, oMovModule) : nullptr;
+                      car = mod != nullptr;
+                      if (car && gSpeedOn) {
+                          float k = gKmh;
+                          *(float*)((char*)mod + oMaxOverride) = k;
+                          *(float*)((char*)mod + oMinSpeed) = k;
+                      }
+                  }
+                  if (moneyOk && tick % kMoneyEvery == 0) {
+                      P prof = nullptr;
+                      il2cpp_field_static_get_value(fProfileCur, &prof);
+                      if (prof) {
+                          int w = gMoneyOnce.exchange(-1);
+                          if (w < 0 && gMoneyLock) w = gMoney;
+                          curMoney = Currency(prof, oMoney, w);
+                          w = gGemOnce.exchange(-1);
+                          if (w < 0 && gGemLock) w = gGems;
+                          curGems = Currency(prof, oGems, w);
+                      }
+                  }
+                  if (tick % 200 == 0) {
+                      char buf[160];
+                      snprintf(buf, sizeof buf, "money %s | $ %d | gems %d | car %s",
+                               moneyOk ? "ok" : "FAIL", curMoney, curGems, speedOk ? (car ? "found" : "none") : "FAIL");
+                      Status(buf);
+                  }
+              }
           }
 
           extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
@@ -377,7 +361,7 @@ jobs:
                                   return true;
                           }
                           return false;
-                          
+                      }
                   });
 
                   ui.post(new Runnable() { public void run() {
@@ -402,9 +386,6 @@ jobs:
 
       - name: build native lib (arm64)
         run: |
-          git init -q Dobby
-          git -C Dobby fetch -q --depth 1 https://github.com/jmpews/Dobby.git 5dfc8546954ce3b3198132ab13fddb89ee92cdd7
-          git -C Dobby checkout -q FETCH_HEAD
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           cmake -S native -B build -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
@@ -425,4 +406,4 @@ jobs:
           gh release delete mod -y --cleanup-tag || true
           gh release create mod build/libmod.so dex/classes.dex --title mod --notes "libmod.so (arm64) + ui dex"
           
-      
+          
